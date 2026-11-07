@@ -29,6 +29,7 @@ struct ContentView: View {
     @State private var editor: Todo?
     @State private var selectedDay = Date.now
     @State private var showCompleted = false
+    @State private var showingAccount = false
     @State private var showingSearch = false
     @State private var searchedTask: Todo?
     @State private var listEditor: ListDraft?
@@ -59,8 +60,9 @@ struct ContentView: View {
         .sheet(isPresented: $showingSearch, onDismiss: openSearchResult) {
             searchPage
         }
+        .sheet(isPresented: $showingAccount) { CloudAccountView(store: store) }
         .alert("Wo行", isPresented: Binding(
-            get: { store.message != nil && editor == nil && listEditor == nil },
+            get: { store.message != nil && editor == nil && listEditor == nil && !showingAccount },
             set: { if !$0 { store.message = nil } }
         )) {
             Button("知道了", role: .cancel) { store.message = nil }
@@ -71,6 +73,14 @@ struct ContentView: View {
             if scenePhase == .active {
                 today = Calendar.current.startOfDay(for: .now)
                 store.refreshReminders()
+                store.syncNow()
+            }
+        }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(30)) } catch { return }
+                store.syncNow()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .NSCalendarDayChanged)) { _ in
@@ -138,7 +148,13 @@ struct ContentView: View {
         .navigationTitle("Wo行")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) { searchButton }
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                searchButton
+                Button { showingAccount = true } label: {
+                    Image(systemName: store.session == nil ? "person.crop.circle" : "person.crop.circle.fill")
+                }
+                .accessibilityLabel("账号与同步")
+            }
         }
         .overlay(alignment: .bottomTrailing) {
             Button { editor = Todo(dueDate: today) } label: {
@@ -187,6 +203,16 @@ struct ContentView: View {
             listLink("全部任务", icon: "tray.full", scope: .all)
             listLink("收件箱", icon: "tray", scope: .list(nil))
             listLink("已完成", icon: "checkmark.circle", scope: .completed)
+            Button { showingAccount = true } label: {
+                HStack {
+                    Label("账号与同步", systemImage: "icloud").foregroundStyle(Palette.ink)
+                    Spacer()
+                    Text(store.session == nil ? "未登录" : store.syncStatus)
+                        .font(.caption).foregroundStyle(Palette.muted)
+                }
+                .padding(.vertical, 6)
+            }
+            .pageRow()
             sectionTitle("我的清单")
             ForEach(store.lists) { list in
                 listLink(list.name, icon: "list.bullet", scope: .list(list.id))

@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import CryptoKit
 import UserNotifications
 
 enum Priority: String, Codable, CaseIterable {
@@ -27,13 +28,13 @@ enum RepeatRule: String, Codable, CaseIterable {
     }
 }
 
-struct Subtask: Identifiable, Codable {
+struct Subtask: Identifiable, Codable, Equatable {
     var id = UUID()
     var title = ""
     var isDone = false
 }
 
-struct Todo: Identifiable, Codable {
+struct Todo: Identifiable, Codable, Equatable {
     var id = UUID()
     var title = ""
     var isDone = false
@@ -49,21 +50,62 @@ struct Todo: Identifiable, Codable {
     var nextOccurrenceID: UUID?
 }
 
-struct TodoList: Identifiable, Codable {
+struct TodoList: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
 }
 
-@MainActor
-final class TodoStore: ObservableObject {
-    private struct Snapshot: Codable {
-        var items: [Todo] = []
-        var lists: [TodoList] = []
+struct TodoSnapshot: Codable, Equatable {
+    var items: [Todo] = []
+    var lists: [TodoList] = []
+
+    func merged(over remote: Self, since base: Self) -> Self {
+        let lists = Self.merge(lists, remote: remote.lists, base: base.lists)
+        let listIDs = Set(lists.map(\.id))
+        let items = Self.merge(items, remote: remote.items, base: base.items).map { item in
+            var item = item
+            if let id = item.listID, !listIDs.contains(id) { item.listID = nil }
+            return item
+        }
+        return Self(items: items, lists: lists)
     }
 
-    @Published private var snapshot = Snapshot()
+    private static func merge<Item: Identifiable & Equatable>(
+        _ local: [Item], remote: [Item], base: [Item]
+    ) -> [Item] {
+        let previous = Dictionary(base.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let current = Dictionary(local.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let incoming = Dictionary(remote.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var seen = Set<Item.ID>()
+        return (remote + local).compactMap { item in
+            let id = item.id
+            guard seen.insert(id).inserted else { return nil }
+            return current[id] == previous[id] ? incoming[id] : current[id]
+        }
+    }
+}
+
+@MainActor
+final class TodoStore: ObservableObject {
+    private struct AccountCache: Codable {
+        var current = TodoSnapshot()
+        var base = TodoSnapshot()
+        var importedGuest = false
+    }
+
+    @Published private var snapshot = TodoSnapshot()
     @Published var message: String?
-    private let url: URL
+    @Published private(set) var session: CloudSession?
+    @Published private(set) var syncStatus = "仅存于本机"
+    @Published private(set) var syncing = false
+    @Published private(set) var authBusy = false
+    @Published private(set) var needsLogin = false
+    private let directory = URL.applicationSupportDirectory
+    private var guest = TodoSnapshot()
+    private var guestReadable = true
+    private var account = AccountCache()
+    private var generation = UUID()
+    private var syncRequested = false
     private var canWrite = true
     private let notificationCenter = UNUserNotificationCenter.current()
     private var reminderRefresh: Task<Void, Never>?
@@ -71,24 +113,41 @@ final class TodoStore: ObservableObject {
 
     var items: [Todo] { snapshot.items }
     var lists: [TodoList] { snapshot.lists }
+    var canImportGuest: Bool {
+        session != nil && canWrite && guestReadable && !account.importedGuest
+            && (!guest.items.isEmpty || !guest.lists.isEmpty)
+    }
+
+    private var guestURL: URL { directory.appendingPathComponent("todos.json") }
+
+    private func cacheURL(_ user: CloudUser) -> URL {
+        directory.appendingPathComponent("woxing-account-\(user.id.uuidString).json")
+    }
 
     init() {
-        let directory = URL.applicationSupportDirectory
-        url = directory.appendingPathComponent("todos.json")
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            if FileManager.default.fileExists(atPath: url.path) {
-                let data = try Data(contentsOf: url)
+            if FileManager.default.fileExists(atPath: guestURL.path) {
+                let data = try Data(contentsOf: guestURL)
                 let decoder = JSONDecoder()
                 if let legacyItems = try? decoder.decode([Todo].self, from: data) {
-                    snapshot.items = legacyItems
+                    guest.items = legacyItems
                 } else {
-                    snapshot = try decoder.decode(Snapshot.self, from: data)
+                    guest = try decoder.decode(TodoSnapshot.self, from: data)
                 }
             }
         } catch {
-            canWrite = false
+            guestReadable = false
             message = "无法读取本地待办。原文件已保留，请重新打开应用后再试。"
+        }
+        snapshot = guest
+        canWrite = guestReadable
+        do {
+            if let restored = try SessionVault.load() {
+                switchToAccount(restored, resetNotifications: false)
+            }
+        } catch {
+            message = error.localizedDescription
         }
     }
 
@@ -182,19 +241,187 @@ final class TodoStore: ObservableObject {
     }
 
     @discardableResult
-    private func commit(_ next: Snapshot) -> Bool {
+    private func commit(_ next: TodoSnapshot) -> Bool {
         guard canWrite else {
             message = "本地数据尚未成功读取，请重新打开应用后再试。"
             return false
         }
         do {
-            try JSONEncoder().encode(next).write(to: url, options: .atomic)
-            snapshot = next
-            refreshReminders()
+            if let session {
+                var updated = account
+                updated.current = next
+                try persist(updated, user: session.user)
+                syncNow()
+            } else {
+                try JSONEncoder().encode(next).write(to: guestURL, options: .atomic)
+                guest = next
+                snapshot = next
+                refreshReminders()
+            }
             return true
         } catch {
             message = "无法保存待办：\(error.localizedDescription)"
             return false
+        }
+    }
+
+    func authenticate(email: String, password: String, registering: Bool) async -> String? {
+        guard !authBusy else { return nil }
+        authBusy = true
+        defer { authBusy = false }
+        do {
+            let email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+            let result: CloudSession?
+            if registering {
+                result = try await CloudAPI.signUp(email: email, password: password)
+            } else {
+                result = try await CloudAPI.signIn(email: email, password: password)
+            }
+            guard let result else { return "请打开邮箱确认注册，然后返回 Wo行 登录。" }
+            try SessionVault.save(result)
+            switchToAccount(result)
+            syncNow()
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    func signOut() {
+        guard let session else { return }
+        do {
+            try SessionVault.clear()
+            generation = UUID()
+            self.session = nil
+            needsLogin = false
+            account = AccountCache()
+            snapshot = guest
+            canWrite = guestReadable
+            syncStatus = "仅存于本机"
+            syncing = false
+            syncRequested = false
+            clearTaskNotifications()
+            Task { await CloudAPI.signOut(session) }
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func importGuest() {
+        guard canImportGuest, let session else { return }
+        var updated = account
+        let itemIDs = Set(updated.current.items.map(\.id))
+        let listIDs = Set(updated.current.lists.map(\.id))
+        updated.current.lists.append(contentsOf: guest.lists.filter { !listIDs.contains($0.id) })
+        updated.current.items.append(contentsOf: guest.items.filter { !itemIDs.contains($0.id) })
+        updated.importedGuest = true
+        do {
+            try persist(updated, user: session.user)
+            syncNow()
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func syncNow() {
+        guard session != nil, canWrite, !needsLogin else { return }
+        syncRequested = true
+        guard !syncing else { return }
+        syncing = true
+        let generation = self.generation
+        Task {
+            defer { if generation == self.generation { syncing = false } }
+            while generation == self.generation, syncRequested {
+                syncRequested = false
+                await syncOnce(generation)
+            }
+        }
+    }
+
+    private func switchToAccount(_ session: CloudSession, resetNotifications: Bool = true) {
+        generation = UUID()
+        syncRequested = false
+        syncing = false
+        needsLogin = false
+        self.session = session
+        account = AccountCache()
+        canWrite = true
+        let url = cacheURL(session.user)
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                account = try JSONDecoder().decode(AccountCache.self, from: Data(contentsOf: url))
+            }
+            syncStatus = "等待同步"
+        } catch {
+            canWrite = false
+            syncStatus = "无法读取账号的本地副本"
+            message = "无法读取账号的本地副本，原文件已保留。"
+        }
+        snapshot = account.current
+        if resetNotifications { clearTaskNotifications() }
+    }
+
+    private func clearTaskNotifications() {
+        // This app only uses notifications for tasks.
+        notificationCenter.removeAllPendingNotificationRequests()
+        notificationCenter.removeAllDeliveredNotifications()
+        refreshReminders()
+    }
+
+    private func persist(_ cache: AccountCache, user: CloudUser) throws {
+        try JSONEncoder().encode(cache).write(to: cacheURL(user), options: .atomic)
+        account = cache
+        if snapshot != cache.current {
+            snapshot = cache.current
+            refreshReminders()
+        }
+    }
+
+    private func syncOnce(_ generation: UUID) async {
+        guard var session else { return }
+        syncStatus = "正在同步…"
+        do {
+            if session.expiresAt <= Date.now.timeIntervalSince1970 + 60 {
+                do {
+                    let renewed = try await CloudAPI.renew(session)
+                    guard generation == self.generation, renewed.user.id == session.user.id else { return }
+                    try SessionVault.save(renewed)
+                    session = renewed
+                    self.session = renewed
+                } catch let error as CloudError where error.requiresLogin || [400, 401, 403].contains(error.status) {
+                    guard generation == self.generation else { return }
+                    needsLogin = true
+                    syncRequested = false
+                    syncStatus = "登录已过期，待办已保存在本机"
+                    return
+                }
+            }
+
+            for _ in 0..<3 {
+                let remote = try await CloudAPI.load(session)
+                guard generation == self.generation else { return }
+                let incoming = remote?.payload ?? TodoSnapshot()
+                let local = account.current
+                let merged = local.merged(over: incoming, since: account.base)
+                if merged != incoming {
+                    let saved = try await CloudAPI.save(merged, after: remote?.revision ?? 0, with: session)
+                    guard generation == self.generation else { return }
+                    if !saved { continue }
+                }
+
+                var updated = account
+                updated.current = account.current.merged(over: merged, since: local)
+                updated.base = merged
+                if updated.current != account.current || updated.base != account.base {
+                    try persist(updated, user: session.user)
+                }
+                syncStatus = "已同步 · \(Date.now.formatted(date: .omitted, time: .shortened))"
+                return
+            }
+            syncStatus = "云端有新改动，稍后重试"
+        } catch {
+            guard generation == self.generation else { return }
+            syncStatus = (error as? CloudError)?.localizedDescription ?? "同步暂未完成，待办已保存在本机"
         }
     }
 
@@ -210,7 +437,11 @@ final class TodoStore: ObservableObject {
         } while date <= today
 
         var upcoming = item
-        upcoming.id = UUID()
+        var bytes = Array(SHA256.hash(data: Data(item.id.uuidString.utf8)).prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x80
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        upcoming.id = UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                                  bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
         upcoming.createdAt = .now
         upcoming.isDone = false
         upcoming.dueDate = date
