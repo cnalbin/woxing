@@ -2,6 +2,8 @@ import SwiftUI
 
 @MainActor
 struct CloudAccountView: View {
+    private enum Field: Hashable { case email, password }
+
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var store: TodoStore
     @State private var email = ""
@@ -10,6 +12,7 @@ struct CloudAccountView: View {
     @State private var feedback: String?
     @State private var showingImport = false
     @State private var showingSignOut = false
+    @FocusState private var focusedField: Field?
 
     var body: some View {
         NavigationStack {
@@ -48,7 +51,7 @@ struct CloudAccountView: View {
                         Label("未登录时，待办保存在这台手机上。", systemImage: "iphone")
                     }
                 }
-                if let message = feedback ?? store.message {
+                if let message = store.message {
                     Section {
                         Text(message).foregroundStyle(Palette.muted)
                     }
@@ -91,19 +94,37 @@ struct CloudAccountView: View {
     }
 
     private var credentials: some View {
-        Section(store.needsLogin ? "重新登录" : (registering ? "创建账号" : "邮箱登录")) {
-            TextField("邮箱", text: $email)
-                .textContentType(.emailAddress)
-                .keyboardType(.emailAddress)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .disabled(store.authBusy || (store.needsLogin && store.session?.user.email != nil))
-            SecureField("密码", text: $password)
-                .textContentType(registering ? .newPassword : .password)
-                .disabled(store.authBusy)
+        Section {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("邮箱").font(.subheadline.weight(.semibold))
+                TextField("邮箱", text: $email, prompt: Text("请输入能收邮件的邮箱"))
+                    .labelsHidden()
+                    .textContentType(.emailAddress)
+                    .keyboardType(.emailAddress)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($focusedField, equals: .email)
+                    .submitLabel(.next)
+                    .onSubmit { focusedField = .password }
+                    .disabled(store.authBusy || (store.needsLogin && store.session?.user.email != nil))
+            }
+            .padding(.vertical, 4)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("密码").font(.subheadline.weight(.semibold))
+                SecureField("密码", text: $password, prompt: Text(registering ? "请设置密码" : "请输入密码"))
+                    .labelsHidden()
+                    .textContentType(registering ? .newPassword : .password)
+                    .focused($focusedField, equals: .password)
+                    .submitLabel(.go)
+                    .onSubmit(submit)
+                    .disabled(store.authBusy)
+            }
+            .padding(.vertical, 4)
+            if let feedback {
+                Text(feedback).font(.subheadline).foregroundStyle(Palette.ink)
+            }
             Button(registering ? "注册" : "登录", action: submit)
-                .disabled(store.authBusy || email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                          || password.isEmpty || (registering && password.count < 6))
+                .disabled(store.authBusy)
             if store.authBusy {
                 ProgressView().accessibilityLabel("正在连接")
             } else if !store.needsLogin {
@@ -114,16 +135,48 @@ struct CloudAccountView: View {
                 }
                 .font(.subheadline)
             }
+        } header: {
+            Text(store.needsLogin ? "重新登录" : (registering ? "创建账号" : "邮箱登录"))
+        } footer: {
+            if registering {
+                Text("密码至少 6 个字符，注册后需要验证邮箱。")
+            }
         }
     }
 
     private func submit() {
+        guard !store.authBusy else { return }
+        let address = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = address.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty, parts[1].contains("."),
+              !address.contains(where: \.isWhitespace) else {
+            feedback = "请输入有效的邮箱地址。"
+            focusedField = .email
+            return
+        }
+        guard !password.isEmpty else {
+            feedback = "请先输入密码。"
+            focusedField = .password
+            return
+        }
+        guard !registering || password.count >= 6 else {
+            feedback = "密码至少需要 6 个字符。"
+            focusedField = .password
+            return
+        }
+        focusedField = nil
         feedback = nil
         Task {
-            let isRegistration = registering
-            feedback = await store.authenticate(email: email, password: password, registering: isRegistration)
-            password = ""
-            if isRegistration { registering = false }
+            switch await store.authenticate(email: address, password: password, registering: registering) {
+            case .signedIn:
+                password = ""
+            case .confirmationRequired:
+                password = ""
+                registering = false
+                feedback = "请打开邮箱确认注册，然后返回 Wo行 登录。"
+            case .failed(let message):
+                feedback = message
+            }
         }
     }
 }

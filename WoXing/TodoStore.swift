@@ -87,6 +87,12 @@ struct TodoSnapshot: Codable, Equatable {
 
 @MainActor
 final class TodoStore: ObservableObject {
+    enum AuthenticationResult {
+        case signedIn
+        case confirmationRequired
+        case failed(String)
+    }
+
     private struct AccountCache: Codable {
         var current = TodoSnapshot()
         var base = TodoSnapshot()
@@ -265,8 +271,8 @@ final class TodoStore: ObservableObject {
         }
     }
 
-    func authenticate(email: String, password: String, registering: Bool) async -> String? {
-        guard !authBusy else { return nil }
+    func authenticate(email: String, password: String, registering: Bool) async -> AuthenticationResult {
+        guard !authBusy else { return .failed("正在连接，请稍候。") }
         authBusy = true
         defer { authBusy = false }
         do {
@@ -277,13 +283,13 @@ final class TodoStore: ObservableObject {
             } else {
                 result = try await CloudAPI.signIn(email: email, password: password)
             }
-            guard let result else { return "请打开邮箱确认注册，然后返回 Wo行 登录。" }
+            guard let result else { return .confirmationRequired }
             try SessionVault.save(result)
             switchToAccount(result)
             syncNow()
-            return nil
+            return .signedIn
         } catch {
-            return error.localizedDescription
+            return .failed(error.localizedDescription)
         }
     }
 
