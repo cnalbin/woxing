@@ -1,0 +1,18 @@
+name: Build unsigned iOS IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build unsigned IPA
+        run: bash build-unsigned.sh
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: WoXing-unsigned
+          path: build/WoXing-unsigned.ipa
+          if-no-files-found: error
